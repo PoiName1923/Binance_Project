@@ -1,0 +1,263 @@
+services:
+  # Spark Master - Spark Worker: Dùng để xử lý dữ liệu
+  spark-master:
+    image: bitnami/spark:3.5.0
+    container_name: spark-master
+    hostname: spark-master
+    environment:
+      - SPARK_MODE=master
+      - SPARK_MASTER_HOST=spark-master
+      - SPARK_LOCAL_IP=spark-master
+      - SPARK_MASTER_PORT=7077
+      - SPARK_MASTER_WEBUI_PORT=8080
+      - SPARK_DAEMON_MEMORY=1G
+      - SPARK_DEPLOY_SPREADOUT=true
+      # Cấu hình Fair Scheduler và giới hạn resource
+      - SPARK_MASTER_OPTS=-Dspark.scheduler.mode=FAIR
+    ports:
+      - "7077:7077"
+      - "8080:8080"
+    networks:
+      - project-network
+  # Spark Worker
+  spark-worker:
+    image: bitnami/spark:3.5.0
+    container_name: spark-worker
+    hostname: spark-worker
+    environment:
+      - SPARK_MODE=worker
+      - SPARK_MASTER_URL=spark://spark-master:7077
+      - SPARK_WORKER_CORES=4
+      - SPARK_WORKER_MEMORY=4G
+      - SPARK_WORKER_WEBUI_PORT=8081
+      - SPARK_LOCAL_IP=spark-worker
+    ports:
+      - "8081:8081"
+    depends_on:
+      - spark-master
+    networks:
+      - project-network
+  # HDFS: Dùng để lưu trữ dữ liệu tạm thời
+  namenode:
+    image: apache/hadoop:3.3.6
+    container_name: namenode
+    hostname: namenode
+    command: [ "hdfs", "namenode" ]
+    ports:
+      - 9870:9870
+    env_file:
+      - ./envs/hadoop.env
+    volumes:
+      - E:/hadoop/data/namenode:/data/hdfs/namenode
+    environment:
+      ENSURE_NAMENODE_DIR: "/tmp/hadoop-root/dfs/name"
+    networks:
+      - project-network
+  datanode:
+    image: apache/hadoop:3.3.6
+    container_name: datanode
+    command: [ "hdfs", "datanode" ]
+    env_file:
+      - ./envs/hadoop.env
+    volumes:
+      - E:/hadoop/data/datanode:/data/hdfs/datanode
+    networks:
+      - project-network
+  # Postgres: 
+  postgres:
+    image: postgres:16.4
+    container_name: postgres
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_MULTIPLE_DATABASES: ${POSTGRES_DATABASES}"
+    ports:
+      - "5432:5432"
+    volumes:
+      - E:/postgres/data:/var/lib/postgresql/data
+      - ./initdb:/docker-entrypoint-initdb.d # CREATE DATABASE airflow; 
+    networks:
+      - project-network
+  adminer:
+    image: adminer
+    container_name: postgres-express
+    depends_on:
+      - postgres
+    restart: always
+    ports:
+      - "8082:8080"
+    networks:
+      - project-network
+  # Airflow
+  airflow-webserver:
+    build:
+      context: ./docker
+      dockerfile: Dockerfile.airflow
+    container_name: airflow-webserver
+    depends_on:
+      - postgres
+    environment:
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres/airflow
+      AIRFLOW__WEBSERVER__SECRET_KEY: ${AIRFLOW_SECRET_KEY}
+      AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
+      TZ: Asia/Ho_Chi_Minh
+      PYTHONPATH: /opt/airflow/dags
+    volumes:
+      - ./dags:/opt/airflow/dags
+      - ./jars:/opt/airflow/jars
+    ports:
+      - 8083:8080
+    command: >
+      bash -c "
+        airflow db init &&
+        airflow users create --username ${AIRFLOW_USER} --password ${AIRFLOW_PASSWORD} --firstname ${AIRFLOW_FIRSTNAME} --lastname ${AIRFLOW_LASTNAME} --role Admin --email ${AIRFLOW_EMAIL} &&
+        airflow webserver
+      "
+    restart: unless-stopped
+    networks:
+      - project-network
+  airflow-scheduler:
+    build:
+      context: ./docker
+      dockerfile: Dockerfile.airflow
+    container_name: airflow-scheduler
+    depends_on:
+      - airflow-webserver
+    environment:
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres/airflow
+      AIRFLOW__WEBSERVER__SECRET_KEY: ${AIRFLOW_SECRET_KEY}
+      TZ: Asia/Ho_Chi_Minh
+      PYTHONPATH: /opt/airflow/dags
+    volumes:
+      - ./dags:/opt/airflow/dags
+      - ./jars:/opt/airflow/jars
+    command: airflow scheduler
+    restart: unless-stopped
+    networks:
+      - project-network
+  # Streaming Services
+  spark-process:
+    build:
+      context: ./docker
+      dockerfile: Dockerfile.airflow
+    container_name: spark-process
+    depends_on:
+      - websocket-producer
+    volumes:
+      - ./streaming_process:/opt/airflow/streaming_process
+      - ./jars:/opt/airflow/jars
+    command: bash -c "sleep 20 && python /opt/airflow/streaming_process/spark_process.py"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "pgrep", "-f", "spark_process.py"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+    networks:
+      - project-network
+  websocket-producer:
+    build:
+      context: ./docker
+      dockerfile: Dockerfile.airflow
+    container_name: websocket-producer
+    depends_on:
+      - kafka
+    volumes:
+      - ./streaming_process:/opt/airflow/streaming_process
+    command: bash -c "sleep 20 && python /opt/airflow/streaming_process/websocket_producer.py"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "pgrep", "-f", "websocket_producer.py"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+    networks:
+      - project-network
+  # Kafka
+  kafka:
+    image: bitnami/kafka:4.0.0
+    container_name: kafka
+    environment:
+      - KAFKA_CFG_NODE_ID=0
+      - KAFKA_CFG_PROCESS_ROLES=controller,broker
+      - KAFKA_CFG_LISTENERS=PLAINTEXT://:9092,CONTROLLER://:9093
+      - KAFKA_CFG_ADVERTISED_LISTENERS=PLAINTEXT://kafka:9092
+      - KAFKA_CFG_LISTENER_SECURITY_PROTOCOL_MAP=CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+      - KAFKA_CFG_CONTROLLER_QUORUM_VOTERS=0@kafka:9093
+      - KAFKA_CFG_CONTROLLER_LISTENER_NAMES=CONTROLLER
+      - KAFKA_AUTO_CREATE_TOPICS_ENABLE=true
+    ports:
+      - "9092:9092"
+    healthcheck:
+      test: ["CMD", "kafka-topics.sh", "--list", "--bootstrap-server", "kafka:9092"]
+      interval: 5s
+      timeout: 10s
+      retries: 1
+    networks:
+      - project-network
+  kafka-ui:
+    image: provectuslabs/kafka-ui:latest
+    container_name: kafka-ui
+    depends_on:
+      - kafka
+    environment:
+      - KAFKA_CLUSTERS_0_NAME=kafka
+      - KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS=kafka:9092
+    ports:
+      - "8085:8080"
+    networks:
+      - project-network
+
+networks:
+  project-network:
+
+
+# MongoDB:
+  # mongodb:
+  #   image: mongo:8.0.6
+  #   container_name: mongodb
+  #   environment:
+  #     MONGO_INITDB_ROOT_USERNAME: ${MONGO_USERNAME}
+  #     MONGO_INITDB_ROOT_PASSWORD: ${MONGO_PASSWORD}
+  #   ports:
+  #     - "27017:27017"
+  #   volumes:
+  #     - E:/mongo:/data/db
+  #   networks:
+  #     - project-network
+  # mongo-express:
+  #   image: mongo-express
+  #   container_name: mongo-express
+  #   depends_on:
+  #     - mongodb
+  #   ports:
+  #     - "8084:8081"
+  #   environment:
+  #     ME_CONFIG_MONGODB_ADMINUSERNAME: ${MONGO_USERNAME}
+  #     ME_CONFIG_MONGODB_ADMINPASSWORD: ${MONGO_PASSWORD}
+  #     ME_CONFIG_MONGODB_SERVER: mongodb
+  #     ME_CONFIG_MONGODB_PORT: 27017
+  #     ME_CONFIG_MONGODB_URL: mongodb://${MONGO_USERNAME}:${MONGO_PASSWORD}@mongodb:27017/
+  #     ME_CONFIG_BASICAUTH: false
+  #   networks:
+  #     - project-network
+
+  # # Jupyter-Notebook:
+  # jupyter:
+  #   build:
+  #     context: ./docker
+  #     dockerfile: Dockerfile.jupyter
+  #   container_name: jupyter
+  #   environment:
+  #     - JUPYTER_TOKEN=ndtien
+  #   ports:
+  #     - "8888:8888"
+  #   volumes:
+  #     - ./notebook:/home/jovyan/work
+  #     - ./jars:/home/jovyan/work/jars
+  #   networks:
+  #     - project-network
